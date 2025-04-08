@@ -1,6 +1,7 @@
 import argparse
 import itertools
 import json
+import jsonlines
 import os
 import random
 import time
@@ -13,14 +14,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 class AudioDataset(torch.utils.data.Dataset):
 
     def __init__(self, data_config_path, prompt):
-        self.datas = open(data_config_path).readlines()
+        with jsonlines.open(data_config_path, mode='r') as reader:
+            self.datas = list(reader)
         self.prompt = prompt
 
     def __len__(self):
         return len(self.datas)
 
     def __getitem__(self, idx):
-        data = json.loads(self.datas[idx].strip())
+        data = self.datas[idx]
         audio_path = data['audio_path']
 
         return {
@@ -33,13 +35,13 @@ def collate_fn(inputs, tokenizer):
 
     input_texts = [_['input_text'] for _ in inputs]
     audio_path = [_['audio_path'] for _ in inputs]
-    audio_info = [tokenizer.process_audio(_['input_text']) for _ in inputs ]
+    audio_info = [tokenizer.process_audio(_) for _ in input_texts]
     input_tokens = tokenizer(input_texts,
                              return_tensors='pt',
                              padding='longest',
-                             audio_info= audio_info)
+                             audio_info=audio_info)
 
-    return input_tokens.input_ids, input_tokens.attention_mask, audio_path,audio_info
+    return input_tokens.input_ids, input_tokens.attention_mask, audio_path, audio_info
 
 
 class InferenceSampler(torch.utils.data.sampler.Sampler):
@@ -74,7 +76,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, default='')
     parser.add_argument('--data_config_path', type=str, default='')
-    parser.add_argument('--output_path', type=str, default='')
+    parser.add_argument('--output_dir', type=str, default='')
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--num-workers', type=int, default=1)
     parser.add_argument('--seed', type=int, default=0)
@@ -155,8 +157,6 @@ if __name__ == '__main__':
     ]
 
     if torch.distributed.get_rank() == 0:
-        print(f"Evaluating {args.data_config_path} ...")
-
         results = []
         for response, audio_path in zip(merged_responses, merged_audio_paths):
             results.append({
@@ -164,7 +164,8 @@ if __name__ == '__main__':
                 'audio_path': audio_path,
             })
         time_prefix = time.strftime('%y%m%d%H%M%S', time.localtime())
-        results_file = f'{time_prefix}.json'
-        json.dump(results, open(results_file, 'w'))
+        results_file = os.path.join(args.output_dir ,f'{time_prefix}.jsonl')
+        with jsonlines.open(results_file, mode="w") as writer:
+            writer.write_all(results)
 
     torch.distributed.barrier()
